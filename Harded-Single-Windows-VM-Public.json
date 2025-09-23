@@ -64,7 +64,7 @@
     /* --- OSConfig/Script-Parameter --- */
     "scriptUri": {
       "type": "string",
-      "metadata": { "description": "RAW-URL zum Initialize-OSConfig.ps1 (z. B. Storage SAS/GitHub RAW)" }
+      "metadata": { "description": "https://raw.githubusercontent.com/justusknoop/Test/refs/heads/main/Initialize-OSConfig.ps1" }
     },
     "scenario": {
       "type": "string",
