@@ -1,0 +1,266 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.1",
+  "metadata": {
+    "description": "Erstellt eine Windows-VM inkl. Netzwerkressourcen und führt Initialize-OSConfig.ps1 via Custom Script Extension aus (Windows Server 2022/2025)."
+  },
+  "parameters": {
+    "name": {
+      "type": "string",
+      "defaultValue": "vmwebserverdev001",
+      "minLength": 3,
+      "maxLength": 20,
+      "metadata": { "description": "Name der VM: vm<rolle><stage><###>" }
+    },
+    "stage": {
+      "type": "string",
+      "defaultValue": "dev",
+      "allowedValues": [ "dev", "tst", "preprod", "prod" ],
+      "metadata": { "description": "Stage/Umgebung für Namenskonventionen" }
+    },
+    "vmSize": {
+      "type": "string",
+      "defaultValue": "Standard_D4as_v5",
+      "allowedValues": [
+        "Standard_B2ms",
+        "Standard_D4as_v5",
+        "Standard_E8ds_v5"
+      ],
+      "metadata": { "description": "Empfohlene VM-Sizes; aktuelle v5-Generationen, wenn verfügbar." }
+    },
+    "adminUsername": {
+      "type": "string",
+      "metadata": { "description": "Lokaler Admin-Benutzername" }
+    },
+    "adminPassword": {
+      "type": "secureString",
+      "metadata": { "description": "Sicheres Passwort für den lokalen Admin (Key Vault Reference empfohlen)" }
+    },
+    "rdpSource": {
+      "type": "string",
+      "defaultValue": "*",
+      "metadata": { "description": "Quelle/CIDR für RDP (z. B. 203.0.113.0/24). * = überall (nicht empfohlen)" }
+    },
+    "winImage": {
+      "type": "string",
+      "defaultValue": "Windows Server 2022 Datacenter - Gen2",
+      "allowedValues": [
+        "Windows Server 2022 Datacenter - Gen2",
+        "Windows Server 2025 Datacenter - Gen2"
+      ],
+      "metadata": { "description": "Nur Windows Server Editionen, die OSConfig unterstützen." }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": { "description": "Region" }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": { "env": "DEV", "owner": "TEAM" },
+      "metadata": { "description": "Ressourcentags (nicht auf VM angewandt)." }
+    },
+
+    /* --- OSConfig/Script-Parameter --- */
+    "scriptUri": {
+      "type": "string",
+      "metadata": { "description": "RAW-URL zum Initialize-OSConfig.ps1 (z. B. Storage SAS/GitHub RAW)" }
+    },
+    "scenario": {
+      "type": "string",
+      "allowedValues": [ "MemberServer", "WorkgroupMember", "DomainController", "SecuredCore", "DefenderAntivirus" ],
+      "metadata": { "description": "OSConfig-Szenario (wird an Skript übergeben)" }
+    },
+    "overrides": {
+      "type": "array",
+      "defaultValue": [],
+      "metadata": { "description": "Optionale Overrides als Name=Value, z. B. [\"AuditDetailedFileShare=3\",\"MinimumPasswordLength=14\"]" }
+    },
+    "forceUpdateTag": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": { "description": "Wert ändern ⇒ Extension wird erneut ausgeführt (Idempotenz-Trick)." }
+    }
+  },
+  "variables": {
+    "stageLower": "[toLower(parameters('stage'))]",
+    "nicName": "[concat('nic-', parameters('name'), '-', variables('stageLower'), '-001')]",
+    "ipName": "[concat('pip-', parameters('name'), '-', variables('stageLower'), '-001')]",
+    "vnetName": "[concat('vnet-', parameters('name'), '-', variables('stageLower'), '-001')]",
+    "subnetName": "default",
+    "nsgName": "[concat('nsg-', parameters('name'), '-', variables('stageLower'), '-001')]",
+    "imageMap": {
+      "Windows Server 2022 Datacenter - Gen2": {
+        "publisher": "MicrosoftWindowsServer",
+        "offer": "WindowsServer",
+        "sku": "2022-datacenter-g2"
+      },
+      "Windows Server 2025 Datacenter - Gen2": {
+        "publisher": "MicrosoftWindowsServer",
+        "offer": "WindowsServer",
+        "sku": "2025-datacenter-g2"
+      }
+    },
+    "extensionName": "osconfig-customscript",
+    "publisher": "Microsoft.Compute",
+    "type": "CustomScriptExtension",
+    "typeHandlerVersion": "1.10",
+    "scriptFileName": "Initialize-OSConfig.ps1",
+    "overridesJoined": "[join(parameters('overrides'),',')]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "2022-11-01",
+      "name": "[variables('ipName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "sku": { "name": "Standard" },
+      "properties": { "publicIPAllocationMethod": "Static" }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2022-11-01",
+      "name": "[variables('nsgName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "properties": {
+        "securityRules": [
+          {
+            "name": "Allow-RDP",
+            "properties": {
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "3389",
+              "sourceAddressPrefix": "[parameters('rdpSource')]",
+              "destinationAddressPrefix": "*",
+              "access": "Allow",
+              "priority": 1002,
+              "direction": "Inbound"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2022-11-01",
+      "name": "[variables('vnetName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+      ],
+      "properties": {
+        "addressSpace": { "addressPrefixes": [ "10.0.0.0/16" ] },
+        "subnets": [
+          {
+            "name": "[variables('subnetName')]",
+            "properties": {
+              "addressPrefix": "10.0.0.0/24",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2022-11-01",
+      "name": "[variables('nicName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/publicIPAddresses', variables('ipName'))]",
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]"
+      ],
+      "properties": {
+        "ipConfigurations": [
+          {
+            "name": "ipconfig1",
+            "properties": {
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('subnetName'))]"
+              },
+              "privateIPAllocationMethod": "Dynamic",
+              "publicIPAddress": {
+                "id": "[resourceId('Microsoft.Network/publicIPAddresses', variables('ipName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2023-03-01",
+      "name": "[parameters('name')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+      ],
+      "properties": {
+        "hardwareProfile": { "vmSize": "[parameters('vmSize')]" },
+        "osProfile": {
+          "computerName": "[parameters('name')]",
+          "adminUsername": "[parameters('adminUsername')]",
+          "adminPassword": "[parameters('adminPassword')]",
+          "windowsConfiguration": {
+            "provisionVMAgent": true,
+            "enableAutomaticUpdates": true,
+            "patchSettings": { "patchMode": "AutomaticByOS" }
+          }
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "[variables('imageMap')[parameters('winImage')].publisher]",
+            "offer": "[variables('imageMap')[parameters('winImage')].offer]",
+            "sku": "[variables('imageMap')[parameters('winImage')].sku]",
+            "version": "latest"
+          },
+          "osDisk": {
+            "createOption": "FromImage",
+            "managedDisk": { "storageAccountType": "StandardSSD_LRS" }
+          }
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            { "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]" }
+          ]
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines/extensions",
+      "apiVersion": "2023-09-01",
+      "name": "[format('{0}/{1}', parameters('name'), variables('extensionName'))]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Compute/virtualMachines', parameters('name'))]"
+      ],
+      "properties": {
+        "publisher": "[variables('publisher')]",
+        "type": "[variables('type')]",
+        "typeHandlerVersion": "[variables('typeHandlerVersion')]",
+        "autoUpgradeMinorVersion": true,
+        "forceUpdateTag": "[parameters('forceUpdateTag')]",
+        "settings": {
+          "fileUris": [ "[parameters('scriptUri')]" ],
+          "timestamp": "[utcNow()]"
+        },
+        "protectedSettings": {
+          "commandToExecute": "[format('powershell -NoProfile -ExecutionPolicy Bypass -Command \"& {{ $ov = @(); if (\\\"{0}\\\" -ne \\\"\\\") {{ $ov = \\\"{0}\\\".Split(\\\",\\\") }} $script = Join-Path $env:TEMP \\\"{1}\\\"; if (Test-Path \\\"{1}\\\") {{ Copy-Item -Path \\\"{1}\\\" -Destination $script -Force }}; & $script -Scenario \\\"{2}\\\"{3} }}\"', variables('overridesJoined'), variables('scriptFileName'), parameters('scenario'), if(empty(parameters('overrides')), '', ' -Override $ov')) ]"
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "publicIp": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Network/publicIPAddresses', variables('ipName'))).ipAddress]"
+    }
+  }
+}
