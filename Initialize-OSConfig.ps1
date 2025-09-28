@@ -16,10 +16,6 @@
     .PARAMETER Scenario
         Das anzuwendende Szenario (z.B. 'MemberServer').
 
-    .PARAMETER Override
-        Liste von "Name=Value"-Paaren zur Anpassung einzelner Einstellungen.
-        Beispiel: "AuditDetailedFileShare=3","MinimumPasswordLength=14"
-
     .NOTES
         Autor:       Justus Knoop (thinformatics AG))
         Erstellt:    2025-09-23
@@ -27,10 +23,8 @@
         GitHub:      https://github.com/thinformatics/azure-lz-templates
 
     .EXAMPLE
-        .\Initialize-OSConfig.ps1 -Scenario MemberServer -Override "AuditDetailedFileShare=3","MinimumPasswordLength=14"
-        Initialisiert die Baseline für einen Member Server, setzt die detaillierte Dateifreigabeüberwachung
-        auf "Erfolgreich und Fehlgeschlagen" und die minimale Passwortlänge auf 14 Zeichen.
-        Am Ende wird der Computer neu gestartet.
+        .\Initialize-OSConfig.ps1 -Scenario MemberServer 
+        Initialisiert die Baseline für einen Member Server.
 
     .LINK
         https://learn.microsoft.com/de-de/windows-server/security/osconfig/osconfig-overview
@@ -45,11 +39,7 @@ param(
     # Scenario: Welches Szenario soll angewendet werden?
     [Parameter(Mandatory=$true)]
     [ValidateSet('MemberServer','WorkgroupMember','DomainController','SecuredCore','DefenderAntivirus')]
-    [string]$Scenario,
-
-    # Optional: "Name=Value", z.B. "AuditDetailedFileShare=3"
-    [Parameter(Mandatory=$false)]
-    [string[]]$Override
+    [string]$Scenario
 )
 #endregion
 
@@ -87,11 +77,6 @@ function Get-ScenarioPath {
 
 #region Hauptskript
 try {
-    if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-        ).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)) {
-        throw "Dieses Skript muss als Administrator ausgeführt werden."
-    }
-
     Install-OSConfigOnline
 
     $scenarioPath = Get-ScenarioPath -Scenario $Scenario
@@ -100,23 +85,6 @@ try {
     # Default-Baseline anwenden
     Set-OSConfigDesiredConfiguration -Scenario $scenarioPath -Default -ErrorAction Stop
 
-    # Optionale Overrides
-    foreach ($ov in $Override) {
-        if ($ov -notmatch '=') { Write-Warning "Überspringe ungültigen Override '$ov' (erwartet Name=Value)."; continue }
-        $name,$value = $ov.Split('=',2)
-        Write-Host "Override: $name = $value"
-        Set-OSConfigDesiredConfiguration -Scenario $scenarioPath -Setting $name -Value $value -ErrorAction Stop
-    }
-
-    # Compliance-Check
-    $result = Get-OSConfigDesiredConfiguration -Scenario $scenarioPath
-    $nonCompliant = $result | Where-Object { $_.Compliance.Status -ne 'Compliant' }
-    if ($nonCompliant) {
-        Write-Warning "Nicht konforme Einträge erkannt (siehe Tabelle):"
-        $nonCompliant | Format-Table Name, @{N='Status';E={$_.Compliance.Status}}, @{N='Reason';E={$_.Compliance.Reason}} -AutoSize
-    } else {
-        Write-Host "Alle geprüften Einstellungen sind konform."
-    }
     exit 0
 }
 
