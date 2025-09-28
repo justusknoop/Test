@@ -117,10 +117,6 @@ try {
     } else {
         Write-Host "Alle geprüften Einstellungen sind konform."
     }
-
-    # Computer neu starten.
-    Write-Host "Neustart wird ausgelöst..."
-    Restart-Computer -Force
 }
 
 # Catch-Block für Fehlerbehandlung
