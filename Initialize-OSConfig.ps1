@@ -117,6 +117,7 @@ try {
     } else {
         Write-Host "Alle geprüften Einstellungen sind konform."
     }
+    exit 0
 }
 
 # Catch-Block für Fehlerbehandlung
