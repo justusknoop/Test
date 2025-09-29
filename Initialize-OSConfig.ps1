@@ -5,6 +5,7 @@
     .DESCRIPTION
         Dieses Skript installiert das PowerShell-Modul Microsoft.OSConfig aus der PSGallery,
         wendet eine vordefinierte Sicherheitsbaseline an und überprüft die Konformität.
+        Zusätzlich erstellt es einen TXT-Report der Änderungen (Vorher/Nachher) unter C:\Users\Public\Documents.
         
         Unterstützte Szenarien:
         - MemberServer        | Windows Server, Mitglied einer Domäne (z. B. Fileserver, Applikationsserver).
@@ -19,7 +20,7 @@
     .NOTES
         Autor:       Justus Knoop (thinformatics AG))
         Erstellt:    2025-09-23
-        Version:     1.0.0
+        Version:     1.0.1
         GitHub:      https://github.com/thinformatics/azure-lz-templates
 
     .EXAMPLE
@@ -43,23 +44,37 @@ param(
 )
 #endregion
 
+# --- Unattended Defaults ---
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+$InformationPreference = 'SilentlyContinue'  # Telemetrie-Hinweis stummschalten
+
+# --- Report-Ziel: Public Documents ---
+$PublicDocs = Join-Path $env:PUBLIC 'Documents'
+try { New-Item -ItemType Directory -Path $PublicDocs -Force -ErrorAction SilentlyContinue | Out-Null } catch {}
+$ts     = Get-Date -Format 'yyyyMMdd_HHmmss'
+$OutTxt = Join-Path $PublicDocs ("OSConfig_Aenderungen_{0}_{1}.txt" -f $env:COMPUTERNAME, $ts)
+
 #region Funktionen
 function Install-OSConfigOnline {
     Write-Verbose "Installiere Microsoft.OSConfig (Online) aus PSGallery..."
 
     # NuGet-Provider sicherstellen
     if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
-        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction Stop
+        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Confirm:$false -ErrorAction Stop
     }
 
-    # PSGallery ggf. vertrauen (vermeidet Prompt in unbeaufsichtigten Deployments)
-    try { Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted -ErrorAction Stop } catch {}
+    # PSGallery ggf. registrieren und vertrauen
+    $repo = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
+    if (-not $repo) {
+        Register-PSRepository -Name 'PSGallery' -SourceLocation 'https://www.powershellgallery.com/api/v2' -InstallationPolicy Trusted -ErrorAction Stop
+    } elseif ($repo.InstallationPolicy -ne 'Trusted') {
+        Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted -ErrorAction Stop
+    }
 
-    # Modul installieren/aktualisieren
-    Install-Module -Name Microsoft.OSConfig -Scope AllUsers -Force -ErrorAction Stop
-
-    # Laden prüfen
-    Import-Module Microsoft.OSConfig -ErrorAction Stop
+    # Modul installieren/aktualisieren + importieren
+    Install-Module -Name Microsoft.OSConfig -Scope AllUsers -Repository PSGallery -Force -AcceptLicense -Confirm:$false -ErrorAction Stop
+    Import-Module Microsoft.OSConfig -Force -ErrorAction Stop
 }
 
 function Get-ScenarioPath {
@@ -73,6 +88,13 @@ function Get-ScenarioPath {
         default              { throw "Unbekanntes Szenario: $Scenario" }
     }
 }
+
+function Index-ByName {
+    param([object[]]$Items)
+    $map = @{}
+    foreach ($i in $Items) { if ($null -ne $i.Name) { $map[$i.Name] = $i } }
+    return $map
+}
 #endregion
 
 #region Hauptskript
@@ -80,17 +102,96 @@ try {
     Install-OSConfigOnline
 
     $scenarioPath = Get-ScenarioPath -Scenario $Scenario
-    Write-Host "Wende Baseline an: $scenarioPath"
+
+    # Snapshot VORHER
+    $before = @(Get-OSConfigDesiredConfiguration -Scenario $scenarioPath -ErrorAction Stop)
+    $beforeIdx = Index-ByName -Items $before
 
     # Default-Baseline anwenden
     Set-OSConfigDesiredConfiguration -Scenario $scenarioPath -Default -ErrorAction Stop
 
+    # Snapshot NACHHER
+    $after = @(Get-OSConfigDesiredConfiguration -Scenario $scenarioPath -ErrorAction Stop)
+    $afterIdx = Index-ByName -Items $after
+
+    # Auswertung (Remediiert / weiterhin NonCompliant / neu NonCompliant)
+    $remediated = New-Object System.Collections.Generic.List[object]
+    $stillNC    = New-Object System.Collections.Generic.List[object]
+    $newNC      = New-Object System.Collections.Generic.List[object]
+
+    foreach ($name in $afterIdx.Keys) {
+        $a = $afterIdx[$name]
+        $aStat   = $a.Compliance.Status
+        $aReason = $a.Compliance.Reason
+
+        $b = $beforeIdx[$name]
+        $bStat   = $b?.Compliance?.Status
+        $bReason = $b?.Compliance?.Reason
+
+        if ($bStat -ne 'Compliant' -and $aStat -eq 'Compliant') {
+            $remediated.Add([pscustomobject]@{ Name=$name; BeforeStatus=$bStat; BeforeReason=$bReason; AfterStatus=$aStat })
+        }
+        elseif ($bStat -ne 'Compliant' -and $aStat -ne 'Compliant') {
+            $stillNC.Add([pscustomobject]@{ Name=$name; Status=$aStat; Reason=$aReason })
+        }
+        elseif ($bStat -eq 'Compliant' -and $aStat -ne 'Compliant') {
+            $newNC.Add([pscustomobject]@{ Name=$name; Status=$aStat; Reason=$aReason })
+        }
+    }
+
+    $totalBefore = $before.Count
+    $ncBefore    = ($before | Where-Object { $_.Compliance.Status -ne 'Compliant' }).Count
+    $totalAfter  = $after.Count
+    $ncAfter     = ($after  | Where-Object { $_.Compliance.Status -ne 'Compliant' }).Count
+
+    # TXT-Report schreiben (nur Ergebnisübersicht, kein Ablauf)
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("OSConfig – Änderungen durch Baseline (Vorher/Nachher)")
+    $lines.Add("Host: $env:COMPUTERNAME")
+    $lines.Add("Scenario: $Scenario ($scenarioPath)")
+    $lines.Add("Zeitpunkt: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    $lines.Add("")
+    $lines.Add(("Übersicht: Total(Vorher)={0} | NonCompliant(Vorher)={1} | Total(Nachher)={2} | NonCompliant(Nachher)={3}" -f $totalBefore,$ncBefore,$totalAfter,$ncAfter))
+    $lines.Add(("Remediiert: {0} | Weiterhin NonCompliant: {1} | Neu NonCompliant: {2}" -f $remediated.Count,$stillNC.Count,$newNC.Count))
+    $lines.Add("")
+
+    $maxItems = 100
+    if ($remediated.Count -gt 0) {
+        $lines.Add("Remediiert (max. $maxItems):")
+        foreach ($i in $remediated | Select-Object -First $maxItems) {
+            $lines.Add(" - {0} | vorher: {1} ({2}) -> nachher: {3}" -f $i.Name, ($i.BeforeStatus ?? 'n/a'), ($i.BeforeReason ?? 'n/a'), $i.AfterStatus)
+        }
+        $lines.Add("")
+    }
+    if ($stillNC.Count -gt 0) {
+        $lines.Add("Weiterhin nicht konform (max. $maxItems):")
+        foreach ($i in $stillNC | Select-Object -First $maxItems) {
+            $lines.Add(" - {0}: {1} ({2})" -f $i.Name, $i.Status, $i.Reason)
+        }
+        $lines.Add("")
+    }
+    if ($newNC.Count -gt 0) {
+        $lines.Add("Neu nicht konform (max. $maxItems):")
+        foreach ($i in $newNC | Select-Object -First $maxItems) {
+            $lines.Add(" - {0}: {1} ({2})" -f $i.Name, $i.Status, $i.Reason)
+        }
+        $lines.Add("")
+    }
+
+    if ($ncAfter -eq 0) {
+        $lines.Add("Ergebnis: Alle geprüften Einstellungen sind nach der Anwendung konform.")
+    } else {
+        $lines.Add("Ergebnis: Es verbleiben nicht konforme Einstellungen. Details siehe oben.")
+    }
+
+    $lines -join [Environment]::NewLine | Out-File -FilePath $OutTxt -Encoding UTF8
+
     exit 0
 }
-
-# Catch-Block für Fehlerbehandlung
 catch {
-    Write-Error $_.Exception.Message
+    # Fehlermeldung in TXT schreiben, damit immer ein Artefakt entsteht
+    $msg = "FEHLER: " + $_.Exception.Message
+    try { $msg | Out-File -FilePath $OutTxt -Encoding UTF8 } catch {}
     exit 1
 }
 #endregion
