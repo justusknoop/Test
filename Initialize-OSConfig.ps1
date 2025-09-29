@@ -20,7 +20,7 @@
     .NOTES
         Autor:       Justus Knoop (thinformatics AG))
         Erstellt:    2025-09-23
-        Version:     1.0.1
+        Version:     1.0.2   # PS 5.1 kompatibel (keine '?.' / '??')
         GitHub:      https://github.com/thinformatics/azure-lz-templates
 
     .EXAMPLE
@@ -59,12 +59,10 @@ $OutTxt = Join-Path $PublicDocs ("OSConfig_Aenderungen_{0}_{1}.txt" -f $env:COMP
 function Install-OSConfigOnline {
     Write-Verbose "Installiere Microsoft.OSConfig (Online) aus PSGallery..."
 
-    # NuGet-Provider sicherstellen
     if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
         Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Confirm:$false -ErrorAction Stop
     }
 
-    # PSGallery ggf. registrieren und vertrauen
     $repo = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
     if (-not $repo) {
         Register-PSRepository -Name 'PSGallery' -SourceLocation 'https://www.powershellgallery.com/api/v2' -InstallationPolicy Trusted -ErrorAction Stop
@@ -72,7 +70,6 @@ function Install-OSConfigOnline {
         Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted -ErrorAction Stop
     }
 
-    # Modul installieren/aktualisieren + importieren
     Install-Module -Name Microsoft.OSConfig -Scope AllUsers -Repository PSGallery -Force -AcceptLicense -Confirm:$false -ErrorAction Stop
     Import-Module Microsoft.OSConfig -Force -ErrorAction Stop
 }
@@ -92,8 +89,26 @@ function Get-ScenarioPath {
 function Index-ByName {
     param([object[]]$Items)
     $map = @{}
-    foreach ($i in $Items) { if ($null -ne $i.Name) { $map[$i.Name] = $i } }
+    foreach ($i in $Items) { if ($null -ne $i -and $null -ne $i.Name) { $map[$i.Name] = $i } }
     return $map
+}
+
+function Nz {
+    param($Value, $Fallback='n/a')
+    if ($null -eq $Value) { return $Fallback }
+    if ($Value -is [string] -and $Value -eq '') { return $Fallback }
+    return $Value
+}
+
+function Get-ComplianceStatus($obj) {
+    if ($null -eq $obj) { return $null }
+    if ($null -eq $obj.Compliance) { return $null }
+    return $obj.Compliance.Status
+}
+function Get-ComplianceReason($obj) {
+    if ($null -eq $obj) { return $null }
+    if ($null -eq $obj.Compliance) { return $null }
+    return $obj.Compliance.Reason
 }
 #endregion
 
@@ -114,19 +129,19 @@ try {
     $after = @(Get-OSConfigDesiredConfiguration -Scenario $scenarioPath -ErrorAction Stop)
     $afterIdx = Index-ByName -Items $after
 
-    # Auswertung (Remediiert / weiterhin NonCompliant / neu NonCompliant)
+    # Auswertung
     $remediated = New-Object System.Collections.Generic.List[object]
     $stillNC    = New-Object System.Collections.Generic.List[object]
     $newNC      = New-Object System.Collections.Generic.List[object]
 
     foreach ($name in $afterIdx.Keys) {
         $a = $afterIdx[$name]
-        $aStat   = $a.Compliance.Status
-        $aReason = $a.Compliance.Reason
+        $aStat   = Get-ComplianceStatus $a
+        $aReason = Get-ComplianceReason $a
 
         $b = $beforeIdx[$name]
-        $bStat   = $b?.Compliance?.Status
-        $bReason = $b?.Compliance?.Reason
+        $bStat   = Get-ComplianceStatus $b
+        $bReason = Get-ComplianceReason $b
 
         if ($bStat -ne 'Compliant' -and $aStat -eq 'Compliant') {
             $remediated.Add([pscustomobject]@{ Name=$name; BeforeStatus=$bStat; BeforeReason=$bReason; AfterStatus=$aStat })
@@ -140,11 +155,11 @@ try {
     }
 
     $totalBefore = $before.Count
-    $ncBefore    = ($before | Where-Object { $_.Compliance.Status -ne 'Compliant' }).Count
+    $ncBefore    = ($before | Where-Object { (Get-ComplianceStatus $_) -ne 'Compliant' }).Count
     $totalAfter  = $after.Count
-    $ncAfter     = ($after  | Where-Object { $_.Compliance.Status -ne 'Compliant' }).Count
+    $ncAfter     = ($after  | Where-Object { (Get-ComplianceStatus $_) -ne 'Compliant' }).Count
 
-    # TXT-Report schreiben (nur Ergebnisübersicht, kein Ablauf)
+    # TXT-Report schreiben
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add("OSConfig – Änderungen durch Baseline (Vorher/Nachher)")
     $lines.Add("Host: $env:COMPUTERNAME")
@@ -159,21 +174,21 @@ try {
     if ($remediated.Count -gt 0) {
         $lines.Add("Remediiert (max. $maxItems):")
         foreach ($i in $remediated | Select-Object -First $maxItems) {
-            $lines.Add(" - {0} | vorher: {1} ({2}) -> nachher: {3}" -f $i.Name, ($i.BeforeStatus ?? 'n/a'), ($i.BeforeReason ?? 'n/a'), $i.AfterStatus)
+            $lines.Add(" - {0} | vorher: {1} ({2}) -> nachher: {3}" -f $i.Name, (Nz $i.BeforeStatus), (Nz $i.BeforeReason), (Nz $i.AfterStatus))
         }
         $lines.Add("")
     }
     if ($stillNC.Count -gt 0) {
         $lines.Add("Weiterhin nicht konform (max. $maxItems):")
         foreach ($i in $stillNC | Select-Object -First $maxItems) {
-            $lines.Add(" - {0}: {1} ({2})" -f $i.Name, $i.Status, $i.Reason)
+            $lines.Add(" - {0}: {1} ({2})" -f $i.Name, (Nz $i.Status), (Nz $i.Reason))
         }
         $lines.Add("")
     }
     if ($newNC.Count -gt 0) {
         $lines.Add("Neu nicht konform (max. $maxItems):")
         foreach ($i in $newNC | Select-Object -First $maxItems) {
-            $lines.Add(" - {0}: {1} ({2})" -f $i.Name, $i.Status, $i.Reason)
+            $lines.Add(" - {0}: {1} ({2})" -f $i.Name, (Nz $i.Status), (Nz $i.Reason))
         }
         $lines.Add("")
     }
@@ -189,7 +204,6 @@ try {
     exit 0
 }
 catch {
-    # Fehlermeldung in TXT schreiben, damit immer ein Artefakt entsteht
     $msg = "FEHLER: " + $_.Exception.Message
     try { $msg | Out-File -FilePath $OutTxt -Encoding UTF8 } catch {}
     exit 1
